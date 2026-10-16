@@ -1,0 +1,100 @@
+name: Check repaired bundle distribution diagnostics
+on:
+  push:
+    branches: [verify/release-arm64-signature-20261016]
+    paths: [.github/workflows/check-fixed-distribution.yml]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  diagnose:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: '12057409491'
+          run-id: '38929660184'
+          repository: zhihanhe/tinyImage
+          github-token: ${{ github.token }}
+          path: artifact
+          merge-multiple: true
+      - name: Validate unchanged payload and compare distribution checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports control.app/Contents/MacOS
+          FIXED="$(find artifact -name tinyimage-1.2.8-arm64-mac-adhoc-fixed.zip -type f)"
+          test -n "$FIXED"
+          echo "9ef703e337cc6076f5c3196ec1956977e22b67b46335b8d4e600ee98610693b7  $FIXED" | shasum -a 256 -c -
+          ditto -x -k "$FIXED" fixed-app
+          curl --fail --location --retry 2 -o original.zip https://github.com/zhihanhe/tinyImage/releases/download/1.27/tinyimage-1.2.8-arm64-mac.zip
+          echo 'd8dae6b42aaa2c7a2557ffa911d5ee9a21e8dae8dc8b6c8697524e584c208240  original.zip' | shasum -a 256 -c -
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/control.c"
+          clang -arch arm64 "$RUNNER_TEMP/control.c" -o control.app/Contents/MacOS/control
+          cat > control.app/Contents/Info.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>CFBundleExecutable</key><string>control</string><key>CFBundleIdentifier</key><string>org.example.tinyimage-diagnostic-control</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>
+          PLIST
+          codesign --force --sign - --timestamp=none control.app
+          python3 <<'PY'
+          import hashlib, json, pathlib, struct, subprocess, zipfile
+          fixed=next(pathlib.Path('artifact').rglob('tinyimage-1.2.8-arm64-mac-adhoc-fixed.zip'))
+          def normalize_macho(blob):
+              assert blob[:4]==b'\xcf\xfa\xed\xfe'
+              assert struct.unpack_from('<I',blob,4)[0]==0x0100000c
+              data=bytearray(blob)
+              count=struct.unpack_from('<I',data,16)[0]
+              offset=32
+              signature_offset=None
+              for _ in range(count):
+                  cmd,size=struct.unpack_from('<II',data,offset)
+                  if cmd==0x1d:
+                      signature_offset=struct.unpack_from('<I',data,offset+8)[0]
+                      data[offset+8:offset+16]=b'\0'*8
+                  elif cmd==0x19 and data[offset+8:offset+24].rstrip(b'\0')==b'__LINKEDIT':
+                      data[offset+32:offset+40]=b'\0'*8
+                      data[offset+48:offset+56]=b'\0'*8
+                  offset+=size
+              assert signature_offset is not None
+              return bytes(data[:signature_offset]).rstrip(b'\0')
+          binaries=0
+          with zipfile.ZipFile('original.zip') as old, zipfile.ZipFile(fixed) as new:
+              keys=lambda z:{n for n in z.namelist() if not n.endswith('/') and not n.startswith('__MACOSX/') and '/_CodeSignature/' not in n}
+              assert keys(old)==keys(new), 'Unexpected non-signature payload paths changed'
+              for name in sorted(keys(old)):
+                  a,b=old.read(name),new.read(name)
+                  if a[:4]==b'\xcf\xfa\xed\xfe':
+                      assert normalize_macho(a)==normalize_macho(b), f'Non-signature Mach-O payload differs: {name}'
+                      binaries+=1
+                  else:
+                      assert a==b, f'Non-Mach-O payload differs: {name}'
+          proof=f'All non-signature payload bytes preserved. {binaries} arm64 Mach-O files identical after normalizing only embedded signature data and signing-related LINKEDIT sizes.\n'
+          print(proof,flush=True)
+          pathlib.Path('reports/payload-proof.txt').write_text(proof)
+          report=[]
+          def run(args):
+              try:
+                  r=subprocess.run(args,text=True,capture_output=True,timeout=180)
+                  text='$ '+' '.join(args)+'\nExit='+str(r.returncode)+'\n'+r.stdout+r.stderr
+              except subprocess.TimeoutExpired:
+                  text='$ '+' '.join(args)+'\nTimed out after 180 seconds'
+              print(text,flush=True)
+              report.append(text)
+          run(['sw_vers'])
+          run(['pkgutil','--pkg-info','com.apple.pkg.XProtectPlistConfigData'])
+          for app in ['fixed-app/tinyimage.app','control.app','/System/Applications/Calculator.app']:
+              run(['codesign','--verify','--deep','--strict','--verbose=4',app])
+              run(['syspolicy_check','distribution',app])
+          run(['log','show','--last','10m','--style','compact','--predicate','process == "syspolicy_check" OR process == "syspolicyd" OR process CONTAINS[c] "XProtect"'])
+          pathlib.Path('reports/distribution-controls.txt').write_text('\n'.join(report))
+          PY
+      - name: Upload read-only diagnostic results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fixed-app-distribution-controls
+          path: reports/
+          retention-days: 7
+          if-no-files-found: error
