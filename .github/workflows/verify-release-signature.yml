@@ -1,0 +1,91 @@
+name: Diagnose original release signature integrity
+on:
+  push:
+    branches: [verify/release-arm64-signature-20261016]
+    paths: [.github/workflows/verify-release-signature.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - name: Download and validate the exact released archives
+        run: |
+          set -euo pipefail
+          mkdir -p original reports extracted-zip extracted-dmg
+          curl --fail --location --retry 2 -o original/app.dmg https://github.com/zhihanhe/tinyImage/releases/download/1.27/tinyimage-1.2.8-arm64.dmg
+          curl --fail --location --retry 2 -o original/app.zip https://github.com/zhihanhe/tinyImage/releases/download/1.27/tinyimage-1.2.8-arm64-mac.zip
+          echo 'baf5613a20d9f57dc03e19a6db15dd2633031f1b6ee296cd97ad71b34eddc96f  original/app.dmg' | shasum -a 256 -c -
+          echo 'd8dae6b42aaa2c7a2557ffa911d5ee9a21e8dae8dc8b6c8697524e584c208240  original/app.zip' | shasum -a 256 -c -
+          unzip -t original/app.zip > reports/zip-integrity.txt
+          hdiutil verify original/app.dmg > reports/dmg-integrity.txt
+          ditto -x -k original/app.zip extracted-zip
+          mkdir -p "$RUNNER_TEMP/tinyimage-mount"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/tinyimage-mount" original/app.dmg
+          ditto "$RUNNER_TEMP/tinyimage-mount/tinyimage.app" extracted-dmg/tinyimage.app
+          hdiutil detach "$RUNNER_TEMP/tinyimage-mount"
+      - name: Diagnose signatures without launching the app
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          report = []
+          def run(args):
+              p = subprocess.run(args, text=True, capture_output=True)
+              text = '$ ' + ' '.join(map(str,args)) + '\nExit=' + str(p.returncode) + '\n' + p.stdout + p.stderr
+              report.append(text)
+              print(text, flush=True)
+              return p.returncode
+          def manifest(root):
+              data={}
+              for p in sorted(root.rglob('*')):
+                  key=str(p.relative_to(root))
+                  if p.is_symlink(): data[key]='symlink:'+os.readlink(p)
+                  elif p.is_file(): data[key]=hashlib.sha256(p.read_bytes()).hexdigest()
+              return data
+          zip_app=pathlib.Path('extracted-zip/tinyimage.app')
+          dmg_app=pathlib.Path('extracted-dmg/tinyimage.app')
+          assert zip_app.is_dir() and dmg_app.is_dir()
+          a,b=manifest(zip_app),manifest(dmg_app)
+          mismatch={key:[a.get(key),b.get(key)] for key in a.keys()|b.keys() if a.get(key)!=b.get(key)}
+          report.append('ZIP/DMG file content differences: '+json.dumps(mismatch))
+          print(report[-1], flush=True)
+          for app in [zip_app,dmg_app]:
+              run(['codesign','--verify','--deep','--strict','--verbose=4',str(app)])
+              run(['codesign','-dv','--verbose=4',str(app)])
+              run(['spctl','--assess','--type','execute','--verbose=4',str(app)])
+          for p in sorted(zip_app.rglob('*')):
+              if p.is_symlink(): continue
+              if p.is_dir() and p.suffix in ['.app','.framework']:
+                  run(['codesign','--verify','--strict','--verbose=4',str(p)])
+              elif p.is_file():
+                  desc=subprocess.check_output(['file','-b',str(p)],text=True)
+                  if 'Mach-O' in desc:
+                      run(['codesign','--verify','--strict','--verbose=4',str(p)])
+          pathlib.Path('reports/signature-diagnosis.txt').write_text('\n'.join(report))
+          # Test a correctly sealed ad-hoc copy; do not publish or launch it.
+          subprocess.run(['ditto',str(zip_app),'repair-test/tinyimage.app'],check=True)
+          repaired=pathlib.Path('repair-test/tinyimage.app')
+          for p in sorted(repaired.rglob('*')):
+              if p.is_file() and not p.is_symlink():
+                  desc=subprocess.check_output(['file','-b',str(p)],text=True)
+                  if 'Mach-O' in desc:
+                      subprocess.run(['codesign','--force','--sign','-','--timestamp=none',str(p)],check=True)
+          bundles=[p for p in repaired.rglob('*') if p.is_dir() and not p.is_symlink() and p.suffix in ['.app','.framework']]
+          for p in sorted(bundles,key=lambda p:len(p.parts),reverse=True)+[repaired]:
+              subprocess.run(['codesign','--force','--sign','-','--timestamp=none',str(p)],check=True)
+          report=[]
+          run(['codesign','--verify','--deep','--strict','--verbose=4',str(repaired)])
+          run(['codesign','-dv','--verbose=4',str(repaired)])
+          run(['spctl','--assess','--type','execute','--verbose=4',str(repaired)])
+          pathlib.Path('reports/adhoc-reseal-test.txt').write_text('\n'.join(report))
+          PY
+      - name: Upload diagnostic reports only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tinyimage-signature-diagnostics
+          path: reports/
+          if-no-files-found: error
+          retention-days: 7
