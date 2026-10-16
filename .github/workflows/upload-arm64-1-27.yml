@@ -1,0 +1,88 @@
+name: Upload verified arm64 assets to existing 1.27 release
+on:
+  push:
+    branches: [release/upload-arm64-1-27-20261016]
+    paths: [.github/workflows/upload-arm64-1-27.yml]
+permissions:
+  actions: read
+  contents: write
+jobs:
+  upload:
+    if: github.repository == 'zhihanhe/tinyImage'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download the existing verified build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: '12056872110'
+          run-id: '38926287629'
+          repository: zhihanhe/tinyImage
+          github-token: ${{ github.token }}
+          path: original-artifact
+          merge-multiple: true
+      - name: Verify and upload only the two requested assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib, json, pathlib, subprocess, urllib.request
+          repo = 'zhihanhe/tinyImage'
+          tag = '1.27'
+          release_id = 415132438
+          expected = {
+              'tinyimage-1.2.8-arm64.dmg': 'baf5613a20d9f57dc03e19a6db15dd2633031f1b6ee296cd97ad71b34eddc96f',
+              'tinyimage-1.2.8-arm64-mac.zip': 'd8dae6b42aaa2c7a2557ffa911d5ee9a21e8dae8dc8b6c8697524e584c208240',
+          }
+          def release():
+              result = json.loads(subprocess.check_output(
+                  ['gh', 'api', f'repos/{repo}/releases/tags/{tag}'], text=True))
+              assert result['id'] == release_id and result['tag_name'] == tag
+              assert not result['draft'] and not result.get('immutable', False)
+              return result
+          def sha_file(path):
+              digest = hashlib.sha256()
+              with open(path, 'rb') as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          def sha_url(url):
+              digest = hashlib.sha256()
+              with urllib.request.urlopen(url, timeout=120) as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          initial = release()
+          paths = {}
+          for name, digest in expected.items():
+              matches = list(pathlib.Path('original-artifact').rglob(name))
+              assert len(matches) == 1, (name, matches)
+              path = matches[0]
+              assert sha_file(path) == digest, f'Original artifact checksum mismatch: {name}'
+              paths[name] = path
+              for asset in initial['assets']:
+                  if asset['name'] == name:
+                      assert asset['size'] == path.stat().st_size, f'Existing asset differs: {name}'
+                      assert sha_url(asset['browser_download_url']) == digest, f'Existing asset differs: {name}'
+          for name, path in paths.items():
+              current = release()
+              if any(asset['name'] == name for asset in current['assets']):
+                  print(f'Keeping existing matching asset: {name}')
+                  continue
+              subprocess.run(['gh', 'release', 'upload', tag, str(path), '--repo', repo], check=True)
+          final = release()
+          for name, digest in expected.items():
+              assets = [asset for asset in final['assets'] if asset['name'] == name]
+              assert len(assets) == 1, f'Missing or duplicate release asset: {name}'
+              asset = assets[0]
+              assert asset['state'] == 'uploaded'
+              assert asset['size'] == paths[name].stat().st_size
+              assert sha_url(asset['browser_download_url']) == digest, f'Published checksum mismatch: {name}'
+              print(json.dumps({
+                  'name': name, 'size': asset['size'], 'sha256': digest,
+                  'download_url': asset['browser_download_url'],
+              }))
+          print('Verified original DMG and ZIP are attached to the existing 1.27 release.')
+          PY
