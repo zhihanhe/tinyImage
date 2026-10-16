@@ -50,6 +50,7 @@ jobs:
           NODE
           npm ci --ignore-scripts --legacy-peer-deps --no-audit --no-fund
           cp "$RUNNER_TEMP/original-package-lock.json" package-lock.json
+          git restore -- yarn.lock
           node node_modules/electron/install.js
       - name: Compile original bundled image engines for arm64
         shell: bash
