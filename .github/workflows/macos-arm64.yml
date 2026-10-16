@@ -1,0 +1,149 @@
+name: Build original macOS arm64 package
+on:
+  push:
+    branches: [build/macos-arm64-20261016]
+    paths: [.github/workflows/macos-arm64.yml]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 40
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      npm_config_audit: 'false'
+      npm_config_fund: 'false'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: Check out unchanged original source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: d08541dc0d17182952f95ef9af89e801a8ee1fee
+          persist-credentials: false
+      - name: Set up arm64 Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '18.20.8'
+          architecture: arm64
+      - name: Install exact locked packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(node -p process.arch)" = arm64
+          # Fetch identical integrity-checked tarballs from the canonical registry.
+          cp package-lock.json "$RUNNER_TEMP/original-package-lock.json"
+          node <<'NODE'
+          const fs = require('fs');
+          const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+          function canonicalize(deps) {
+            for (const [name, dep] of Object.entries(deps || {})) {
+              if (dep.resolved && /^https?:\/\/(registry\.npmjs\.org|registry\.npmmirror\.com|registry\.npm\.taobao\.org|mirrors\.cloud\.tencent\.com)\//.test(dep.resolved)) {
+                dep.resolved = 'https://registry.npmjs.org/' + name + '/-/' + name.split('/').pop() + '-' + dep.version + '.tgz';
+              }
+              canonicalize(dep.dependencies);
+            }
+          }
+          canonicalize(lock.dependencies);
+          fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2) + '\n');
+          NODE
+          npm ci --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+          cp "$RUNNER_TEMP/original-package-lock.json" package-lock.json
+          node node_modules/electron/install.js
+      - name: Compile original bundled image engines for arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install autoconf automake libtool libpng pkgconf zlib little-cms2
+          export PNG_PREFIX="$(brew --prefix libpng)"
+          export ZLIB_PREFIX="$(brew --prefix zlib)"
+          export LCMS_PREFIX="$(brew --prefix little-cms2)"
+          export CFLAGS="-arch arm64 -mmacosx-version-min=11.0"
+          export LDFLAGS="-arch arm64 -mmacosx-version-min=11.0"
+          node <<'NODE'
+          const path = require('path');
+          const build = require('bin-build');
+          const root = process.cwd();
+          const png = process.env.PNG_PREFIX;
+          const zlib = process.env.ZLIB_PREFIX;
+          const lcms = process.env.LCMS_PREFIX;
+          async function main() {
+            const jpegDest = path.join(root, 'node_modules/mozjpeg/vendor');
+            await build.file(path.join(jpegDest, 'source/mozjpeg.tar.gz'), [
+              'autoreconf -fiv',
+              './configure --enable-static --disable-shared --disable-dependency-tracking --with-jpeg8 --without-simd CPPFLAGS="-I' + png + '/include" libpng_LIBS="' + png + '/lib/libpng16.a -lz" --prefix="' + jpegDest + '" --bindir="' + jpegDest + '" --libdir="' + jpegDest + '"',
+              'make -j3',
+              'make install -j3'
+            ]);
+            const pngDest = path.join(root, 'node_modules/pngquant-bin/vendor');
+            await build.file(path.join(pngDest, 'source/pngquant.tar.gz'), [
+              'rm -f ./INSTALL',
+              'mkdir -p static-deps && cp "' + png + '/include/"*.h "' + zlib + '/include/"*.h "' + lcms + '/include/"*.h static-deps/ && cp "' + png + '/lib/libpng16.a" "' + zlib + '/lib/libz.a" "' + lcms + '/lib/liblcms2.a" static-deps/',
+              './configure --prefix="' + pngDest + '" --with-libpng=static-deps --disable-sse',
+              'make -j3',
+              'make install BINPREFIX="' + pngDest + '"'
+            ]);
+          }
+          main().catch(error => { console.error(error); process.exit(1); });
+          NODE
+          file node_modules/mozjpeg/vendor/cjpeg node_modules/pngquant-bin/vendor/pngquant
+          test "$(lipo -archs node_modules/mozjpeg/vendor/cjpeg)" = arm64
+          test "$(lipo -archs node_modules/pngquant-bin/vendor/pngquant)" = arm64
+      - name: Package original app as arm64 ZIP and DMG
+        run: |
+          git diff --exit-code
+          ./node_modules/.bin/electron-builder --mac zip dmg --arm64 --publish never
+      - name: Verify every packaged Mach-O file and record checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p verification
+          python3 <<'PY'
+          import pathlib, subprocess
+          apps = list(pathlib.Path('output/mac-arm64').glob('*.app'))
+          assert len(apps) == 1, apps
+          app = apps[0]
+          report, failures = [], []
+          for p in sorted(app.rglob('*')):
+              if not p.is_file() or p.is_symlink():
+                  continue
+              desc = subprocess.check_output(['file', '-b', str(p)], text=True).strip()
+              if 'Mach-O' not in desc:
+                  continue
+              arch = subprocess.check_output(['lipo', '-archs', str(p)], text=True).strip()
+              report.append(f'{p}: {arch}')
+              if arch != 'arm64':
+                  failures.append(f'{p}: unexpected architecture {arch}')
+              linked = subprocess.check_output(['otool', '-L', str(p)], text=True)
+              report.append(linked)
+              if '/opt/homebrew/' in linked or '/usr/local/' in linked:
+                  failures.append(f'{p}: external build-machine library dependency')
+          assert report, 'No Mach-O files found'
+          pathlib.Path('verification/architectures.txt').write_text('\n'.join(report))
+          sig = subprocess.run(['codesign', '-dv', '--verbose=4', str(app)], text=True, capture_output=True)
+          pathlib.Path('verification/signature.txt').write_text(sig.stdout + sig.stderr)
+          assert not failures, '\n'.join(failures)
+          print('\n'.join(report))
+          print(sig.stdout + sig.stderr)
+          PY
+          shasum -a 256 output/*.dmg output/*.zip | tee verification/SHA256SUMS.txt
+          printf 'Source: d08541dc0d17182952f95ef9af89e801a8ee1fee\nElectron: 24.1.2\nBuilder: 23.6.0\nArchitecture: arm64\nDeveloper ID signing: disabled\nNotarization: not requested\n' > verification/build.txt
+      - name: Upload packages and verification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tinyimage-1.2.8-macos-arm64
+          path: |
+            output/*.dmg
+            output/*.zip
+            verification/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: arm64-build-diagnostics
+          path: verification/
+          if-no-files-found: ignore
+          retention-days: 7
