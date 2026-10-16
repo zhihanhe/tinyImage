@@ -101,7 +101,7 @@ jobs:
           set -euo pipefail
           mkdir -p verification
           python3 <<'PY'
-          import pathlib, subprocess
+          import pathlib, shutil, subprocess, tempfile
           apps = list(pathlib.Path('output/mac-arm64').glob('*.app'))
           assert len(apps) == 1, apps
           app = apps[0]
@@ -116,7 +116,11 @@ jobs:
               report.append(f'{p}: {arch}')
               if arch != 'arm64':
                   failures.append(f'{p}: unexpected architecture {arch}')
-              linked = subprocess.check_output(['otool', '-L', str(p)], text=True)
+              # otool interprets trailing parentheses as archive-member syntax.
+              with tempfile.TemporaryDirectory() as scratch:
+                  probe = pathlib.Path(scratch) / 'binary'
+                  shutil.copyfile(p, probe)
+                  linked = subprocess.check_output(['otool', '-L', str(probe)], text=True)
               report.append(linked)
               if '/opt/homebrew/' in linked or '/usr/local/' in linked:
                   failures.append(f'{p}: external build-machine library dependency')
