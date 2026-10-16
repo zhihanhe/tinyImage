@@ -1,4 +1,4 @@
-name: Upload verified arm64 assets to existing 1.27 release
+name: Upload signature-repaired arm64 assets to existing 1.27 release
 on:
   push:
     branches: [release/upload-arm64-1-27-20261016]
@@ -12,14 +12,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Download the existing verified build
+      - name: Download the existing signature-repaired package
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          artifact-ids: '12056872110'
-          run-id: '38926287629'
+          artifact-ids: '12057409491'
+          run-id: '38929660184'
           repository: zhihanhe/tinyImage
           github-token: ${{ github.token }}
-          path: original-artifact
+          path: signature-repaired-artifact
           merge-multiple: true
       - name: Verify and upload only the two requested assets
         env:
@@ -33,8 +33,8 @@ jobs:
           tag = '1.27'
           release_id = 415132438
           expected = {
-              'tinyimage-1.2.8-arm64.dmg': 'baf5613a20d9f57dc03e19a6db15dd2633031f1b6ee296cd97ad71b34eddc96f',
-              'tinyimage-1.2.8-arm64-mac.zip': 'd8dae6b42aaa2c7a2557ffa911d5ee9a21e8dae8dc8b6c8697524e584c208240',
+              'tinyimage-1.2.8-arm64-adhoc-fixed.dmg': '2ff3d4bcae3a99faac7b83ee1cf44d1e212afa8fb2fceb18367ba7183787cbbc',
+              'tinyimage-1.2.8-arm64-mac-adhoc-fixed.zip': '9ef703e337cc6076f5c3196ec1956977e22b67b46335b8d4e600ee98610693b7',
           }
           def release():
               result = json.loads(subprocess.check_output(
@@ -57,7 +57,7 @@ jobs:
           initial = release()
           paths = {}
           for name, digest in expected.items():
-              matches = list(pathlib.Path('original-artifact').rglob(name))
+              matches = list(pathlib.Path('signature-repaired-artifact').rglob(name))
               assert len(matches) == 1, (name, matches)
               path = matches[0]
               assert sha_file(path) == digest, f'Original artifact checksum mismatch: {name}'
@@ -73,6 +73,13 @@ jobs:
                   continue
               subprocess.run(['gh', 'release', 'upload', tag, str(path), '--repo', repo], check=True)
           final = release()
+          for field in ['id', 'tag_name', 'target_commitish', 'name', 'body', 'draft', 'prerelease']:
+              assert final[field] == initial[field], f'Release metadata changed: {field}'
+          for old_asset in initial['assets']:
+              retained = [a for a in final['assets'] if a['id'] == old_asset['id']]
+              assert len(retained) == 1
+              for field in ['name', 'size', 'digest', 'browser_download_url']:
+                  assert retained[0][field] == old_asset[field], f'Existing release asset changed: {field}'
           for name, digest in expected.items():
               assets = [asset for asset in final['assets'] if asset['name'] == name]
               assert len(assets) == 1, f'Missing or duplicate release asset: {name}'
@@ -84,5 +91,5 @@ jobs:
                   'name': name, 'size': asset['size'], 'sha256': digest,
                   'download_url': asset['browser_download_url'],
               }))
-          print('Verified original DMG and ZIP are attached to the existing 1.27 release.')
+          print('Verified signature-repaired DMG and ZIP attached; no Developer ID, notarization, Gatekeeper approval, or successful XProtect scan is claimed.')
           PY
