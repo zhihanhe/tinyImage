@@ -79,8 +79,52 @@ jobs:
           run(['codesign','--verify','--deep','--strict','--verbose=4',str(repaired)])
           run(['codesign','-dv','--verbose=4',str(repaired)])
           run(['spctl','--assess','--type','execute','--verbose=4',str(repaired)])
+          run(['syspolicy_check','distribution',str(repaired)])
           pathlib.Path('reports/adhoc-reseal-test.txt').write_text('\n'.join(report))
           PY
+      - name: Package the corrected signature without changing app code
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fixed-packages
+          codesign --verify --deep --strict --verbose=4 repair-test/tinyimage.app
+          python3 <<'PY'
+          import hashlib, pathlib, subprocess
+          before=pathlib.Path('extracted-zip/tinyimage.app')
+          after=pathlib.Path('repair-test/tinyimage.app')
+          count=0
+          for p in before.rglob('*'):
+              if not p.is_file() or p.is_symlink() or '_CodeSignature' in p.parts:
+                  continue
+              q=after/p.relative_to(before)
+              kind=subprocess.check_output(['file','-b',str(p)],text=True)
+              if 'Mach-O' in kind:
+                  assert subprocess.check_output(['lipo','-archs',str(q)],text=True).strip() == 'arm64'
+                  count+=1
+              else:
+                  assert hashlib.sha256(p.read_bytes()).digest()==hashlib.sha256(q.read_bytes()).digest(), str(p)
+          pathlib.Path('reports/repair-scope.txt').write_text(f'All original non-Mach-O application files unchanged. {count} Mach-O files remain arm64. Only code-signature metadata resealed. No Developer ID or notarization.\n')
+          PY
+          ditto -c -k --sequesterRsrc --keepParent repair-test/tinyimage.app fixed-packages/tinyimage-1.2.8-arm64-mac-adhoc-fixed.zip
+          ln -s /Applications repair-test/Applications
+          hdiutil create -volname tinyimage -srcfolder repair-test -ov -format UDZO fixed-packages/tinyimage-1.2.8-arm64-adhoc-fixed.dmg
+          mkdir -p zip-recheck
+          ditto -x -k fixed-packages/tinyimage-1.2.8-arm64-mac-adhoc-fixed.zip zip-recheck
+          codesign --verify --deep --strict --verbose=4 zip-recheck/tinyimage.app 2>&1 | tee reports/fixed-zip-signature.txt
+          hdiutil verify fixed-packages/tinyimage-1.2.8-arm64-adhoc-fixed.dmg | tee reports/fixed-dmg-integrity.txt
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/tinyimage-mount" fixed-packages/tinyimage-1.2.8-arm64-adhoc-fixed.dmg
+          codesign --verify --deep --strict --verbose=4 "$RUNNER_TEMP/tinyimage-mount/tinyimage.app" 2>&1 | tee reports/fixed-dmg-signature.txt
+          hdiutil detach "$RUNNER_TEMP/tinyimage-mount"
+          shasum -a 256 fixed-packages/* | tee reports/fixed-SHA256SUMS.txt
+      - name: Upload separately named repaired packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tinyimage-arm64-adhoc-signature-fixed
+          path: |
+            fixed-packages/
+            reports/
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload diagnostic reports only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
