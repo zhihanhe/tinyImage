@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   diagnose:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -87,7 +87,7 @@ jobs:
           for app in ['fixed-app/tinyimage.app','control.app','/System/Applications/Calculator.app']:
               run(['codesign','--verify','--deep','--strict','--verbose=4',app])
               run(['syspolicy_check','distribution',app])
-          run(['log','show','--last','10m','--style','compact','--predicate','process == "syspolicy_check" OR process == "syspolicyd" OR process CONTAINS[c] "XProtect"'])
+          run(['log','show','--last','10m','--style','compact','--info','--debug','--predicate','process == "syspolicy_check" OR process == "syspolicyd" OR process CONTAINS[c] "XProtect"'])
           pathlib.Path('reports/distribution-controls.txt').write_text('\n'.join(report))
           PY
       - name: Upload read-only diagnostic results
