@@ -12,3 +12,14 @@ Tinyimage 的界面简洁明了，提供了良好的用户体验，而且功能�
 
 ## 下载
 ### [下载](https://github.com/focusbe/tinyImage/releases)
+
+### macOS Apple Silicon（arm64）1.28
+
+[1.28 发布页](https://github.com/zhihanhe/tinyImage/releases/tag/1.28)：
+
+- [DMG 安装包](https://github.com/zhihanhe/tinyImage/releases/download/1.28/tinyimage-1.2.8-arm64-adhoc-fixed.dmg)
+- [ZIP 压缩包](https://github.com/zhihanhe/tinyImage/releases/download/1.28/tinyimage-1.2.8-arm64-mac-adhoc-fixed.zip)
+
+此版本沿用原版 1.2.8 的应用代码和依赖，提供 Apple Silicon 原生 arm64 构建，并修复应用 bundle 的签名与资源封装。DMG、ZIP 解包后的应用均通过完整签名校验；Release 标签为 1.28，应用内部版本仍为 1.2.8。
+
+安装包使用 ad-hoc 签名，未使用 Developer ID，也未经 Apple 公证；签名完整性校验不代表通过 Gatekeeper 或全面安全审计。
