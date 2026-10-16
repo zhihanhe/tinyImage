@@ -1,4 +1,4 @@
-name: Upload signature-repaired arm64 assets to existing 1.27 release
+name: Publish verified signature-repaired arm64 release 1.28
 on:
   push:
     branches: [release/upload-arm64-1-27-20261016]
@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Download the existing signature-repaired package
+      - name: Download the tested signature-repaired packages
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           artifact-ids: '12057409491'
@@ -21,7 +21,7 @@ jobs:
           github-token: ${{ github.token }}
           path: signature-repaired-artifact
           merge-multiple: true
-      - name: Verify and upload only the two requested assets
+      - name: Publish only the two verified packages as latest 1.28
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -30,66 +30,59 @@ jobs:
           python3 <<'PY'
           import hashlib, json, pathlib, subprocess, urllib.request
           repo = 'zhihanhe/tinyImage'
-          tag = '1.27'
-          release_id = 415132438
+          tag = '1.28'
+          target = '1449ea768259bcbb8b2bb039e52384bda38afb3a'
+          title = '1.28 - macOS Apple Silicon arm64'
+          body = "macOS Apple Silicon（arm64）签名封装修复版。\n\n- 沿用原版 1.2.8 应用代码和依赖，修复 bundle 签名与资源封装，不改应用功能。\n- DMG 和 ZIP 解包后均通过完整签名校验，全部 22 个 Mach-O 均为 arm64。\n- 使用 ad-hoc 签名，未使用 Developer ID，未经 Apple 公证；不代表通过 Gatekeeper 或全面安全审计。\n- Release 标签为 1.28，应用内部版本仍为 1.2.8。"
           expected = {
               'tinyimage-1.2.8-arm64-adhoc-fixed.dmg': '2ff3d4bcae3a99faac7b83ee1cf44d1e212afa8fb2fceb18367ba7183787cbbc',
               'tinyimage-1.2.8-arm64-mac-adhoc-fixed.zip': '9ef703e337cc6076f5c3196ec1956977e22b67b46335b8d4e600ee98610693b7',
           }
-          def release():
-              result = json.loads(subprocess.check_output(
-                  ['gh', 'api', f'repos/{repo}/releases/tags/{tag}'], text=True))
-              assert result['id'] == release_id and result['tag_name'] == tag
-              assert not result['draft'] and not result.get('immutable', False)
-              return result
-          def sha_file(path):
+          def api(method, path, payload=None):
+              args = ['gh', 'api', '--method', method, path]
+              if payload is not None:
+                  args += ['--input', '-']
+              result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None, text=True, capture_output=True, check=True)
+              return json.loads(result.stdout)
+          def sha_stream(source):
               digest = hashlib.sha256()
-              with open(path, 'rb') as source:
-                  for chunk in iter(lambda: source.read(1024 * 1024), b''):
-                      digest.update(chunk)
+              for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                  digest.update(chunk)
               return digest.hexdigest()
-          def sha_url(url):
-              digest = hashlib.sha256()
-              with urllib.request.urlopen(url, timeout=120) as source:
-                  for chunk in iter(lambda: source.read(1024 * 1024), b''):
-                      digest.update(chunk)
-              return digest.hexdigest()
-          initial = release()
           paths = {}
           for name, digest in expected.items():
               matches = list(pathlib.Path('signature-repaired-artifact').rglob(name))
               assert len(matches) == 1, (name, matches)
               path = matches[0]
-              assert sha_file(path) == digest, f'Original artifact checksum mismatch: {name}'
+              with path.open('rb') as source:
+                  assert sha_stream(source) == digest, f'Artifact checksum mismatch: {name}'
               paths[name] = path
-              for asset in initial['assets']:
-                  if asset['name'] == name:
-                      assert asset['size'] == path.stat().st_size, f'Existing asset differs: {name}'
-                      assert sha_url(asset['browser_download_url']) == digest, f'Existing asset differs: {name}'
+          existing = api('GET', f'repos/{repo}/releases?per_page=100')
+          assert all(r['tag_name'] != tag for r in existing), 'Release 1.28 already exists; refusing to overwrite'
+          release = api('POST', f'repos/{repo}/releases', {
+              'tag_name': tag, 'target_commitish': target, 'name': title, 'body': body,
+              'draft': True, 'prerelease': False,
+          })
+          release_id = release['id']
+          print(f'Created draft release {release_id}', flush=True)
           for name, path in paths.items():
-              current = release()
-              if any(asset['name'] == name for asset in current['assets']):
-                  print(f'Keeping existing matching asset: {name}')
-                  continue
               subprocess.run(['gh', 'release', 'upload', tag, str(path), '--repo', repo], check=True)
-          final = release()
-          for field in ['id', 'tag_name', 'target_commitish', 'name', 'body', 'draft', 'prerelease']:
-              assert final[field] == initial[field], f'Release metadata changed: {field}'
-          for old_asset in initial['assets']:
-              retained = [a for a in final['assets'] if a['id'] == old_asset['id']]
-              assert len(retained) == 1
-              for field in ['name', 'size', 'digest', 'browser_download_url']:
-                  assert retained[0][field] == old_asset[field], f'Existing release asset changed: {field}'
-          for name, digest in expected.items():
-              assets = [asset for asset in final['assets'] if asset['name'] == name]
-              assert len(assets) == 1, f'Missing or duplicate release asset: {name}'
-              asset = assets[0]
+          uploaded = api('GET', f'repos/{repo}/releases/{release_id}')
+          assert {a['name'] for a in uploaded['assets']} == set(expected)
+          for asset in uploaded['assets']:
               assert asset['state'] == 'uploaded'
-              assert asset['size'] == paths[name].stat().st_size
-              assert sha_url(asset['browser_download_url']) == digest, f'Published checksum mismatch: {name}'
-              print(json.dumps({
-                  'name': name, 'size': asset['size'], 'sha256': digest,
-                  'download_url': asset['browser_download_url'],
-              }))
-          print('Verified signature-repaired DMG and ZIP attached; no Developer ID, notarization, Gatekeeper approval, or successful XProtect scan is claimed.')
+              assert asset['size'] == paths[asset['name']].stat().st_size
+              assert asset['digest'] == 'sha256:' + expected[asset['name']]
+          published = api('PATCH', f'repos/{repo}/releases/{release_id}', {'draft': False, 'make_latest': 'true'})
+          assert not published['draft'] and published['tag_name'] == tag
+          assert published['name'] == title and published['body'] == body
+          tag_ref = api('GET', f'repos/{repo}/git/ref/tags/{tag}')
+          assert tag_ref['object']['type'] == 'commit' and tag_ref['object']['sha'] == target
+          latest = api('GET', f'repos/{repo}/releases/latest')
+          assert latest['id'] == release_id and latest['tag_name'] == tag
+          for asset in published['assets']:
+              with urllib.request.urlopen(asset['browser_download_url'], timeout=120) as source:
+                  assert sha_stream(source) == expected[asset['name']], f'Published checksum mismatch: {asset["name"]}'
+              print(json.dumps({'name': asset['name'], 'size': asset['size'], 'sha256': expected[asset['name']], 'download_url': asset['browser_download_url']}), flush=True)
+          print(f'Published and verified {published["html_url"]}; 1.27 and its assets were not changed.', flush=True)
           PY
